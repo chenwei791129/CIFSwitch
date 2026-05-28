@@ -1,6 +1,6 @@
 # CIFSwitch
 
-[Writeup](https://heyitsas.im/cifswitch)
+[Writeup](https://heyitsas.im/posts/cifswitch)
 
 > [!WARNING]
 > The PoC is provided solely to help defenders, maintainers, and authorized
