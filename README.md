@@ -21,7 +21,7 @@ The PoC assumes common `x86_64` NSS module directories -- adjust if necessary.
 ## How to test
 
 ```shell
-sudo apt install build-essential cifs-utils
+sudo apt install -y build-essential cifs-utils
 sudo useradd -m -s /bin/bash testuser
 sudo su - testuser
 
