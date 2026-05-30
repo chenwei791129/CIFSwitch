@@ -17,3 +17,16 @@ GCC is required -- the PoC builds two inlined C helpers, a fake NSS library
 the PoC's private namespace and load the fake NSS library.
 
 The PoC assumes common `x86_64` NSS module directories -- adjust if necessary.
+
+## How to test
+
+```shell
+sudo apt install build-essential cifs-utils
+sudo useradd -m -s /bin/bash testuser
+sudo su - testuser
+
+git clone https://github.com/chenwei791129/CIFSwitch.git
+cd CIFSwitch
+chmod +x ./cifswitch-poc.py
+./cifswitch-poc.py
+```
