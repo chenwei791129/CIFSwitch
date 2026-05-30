@@ -30,3 +30,7 @@ cd CIFSwitch
 chmod +x ./cifswitch-poc.py
 ./cifswitch-poc.py
 ```
+
+## DEMO
+
+![DEMO](img/image.png)
